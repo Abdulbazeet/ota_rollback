@@ -1,15 +1,19 @@
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include "esp_ota_ops.h"
 #include <ESPmDNS.h>
+#include <Preferences.h>
+#include "mbedtls/sha256.h"
+
+Preferences prefs;
 
 const char *ssid = "Tony Stank";
 const char *password = "Ba1za22ta@.com#";
 
-#define CURRENT_VERSION 1
+#define CURRENT_VERSION 2
 
 // const char *serverBaseUrl = "http://10.16.190.150:5000";
 // const char *manifestUrl = "http://10.16.190.150:5000/manifest.json";
@@ -20,85 +24,197 @@ const char *manifestUrl = "http://olatunji.local:5000/manifest.json";
 bool otaChecked = false;
 bool wifiReady = false;
 
-// ---------------- OTA FUNCTION ----------------
-// void runOTA(String firmwareUrl)
-// {
-//   Serial.println("Starting OTA update...");
+String bytesToHex(uint8_t *hash, size_t len)
+{
+  String result;
 
-//   HTTPClient updateHttp;
-//   updateHttp.begin(firmwareUrl);
+  for (size_t i = 0; i < len; i++)
+  {
+    char buf[3];
 
-//   t_httpUpdate_return ret = httpUpdate.update(updateHttp);
+    sprintf(buf, "%02x", hash[i]);
 
-//   switch (ret)
-//   {
-//   case HTTP_UPDATE_FAILED:
-//     Serial.printf(
-//         "OTA Failed (%d): %s\n",
-//         httpUpdate.getLastError(),
-//         httpUpdate.getLastErrorString().c_str());
-//     break;
+    result += buf;
+  }
 
-//   case HTTP_UPDATE_NO_UPDATES:
-//     Serial.println("No updates.");
-//     break;
+  return result;
+}
 
-//   case HTTP_UPDATE_OK:
-//     Serial.println("OTA Success! Rebooting...");
-//     break;
-//   }
-
-//   updateHttp.end();
-// }
-
-void runOTA(String firmwareUrl)
+void runOTA(
+    String firmwareUrl,
+    int serverVersion,
+    String expectedHash)
 {
   Serial.println("===== OTA START =====");
 
-  Serial.print("Firmware URL: ");
-  Serial.println(firmwareUrl);
+  HTTPClient http;
 
-  Serial.print("Free Heap Before OTA: ");
-  Serial.println(ESP.getFreeHeap());
+  http.begin(firmwareUrl);
 
-  HTTPClient updateHttp;
+  int httpCode = http.GET();
 
-  bool ok = updateHttp.begin(firmwareUrl);
-
-  Serial.print("HTTP Begin Result: ");
-  Serial.println(ok);
-
-  if (!ok)
+  if (httpCode != HTTP_CODE_OK)
   {
-    Serial.println("Failed to initialize HTTP client");
+    Serial.print("Firmware download failed: ");
+    Serial.println(httpCode);
+    http.end();
     return;
   }
 
-  Serial.println("Calling httpUpdate.update()...");
+  int contentLength = http.getSize();
 
-  t_httpUpdate_return ret = httpUpdate.update(updateHttp);
+  Serial.print("Firmware Size: ");
+  Serial.println(contentLength);
 
-  Serial.println("Returned from httpUpdate.update()");
+  const esp_partition_t *updatePartition =
+      esp_ota_get_next_update_partition(NULL);
 
-  switch (ret)
+  if (!updatePartition)
   {
-  case HTTP_UPDATE_FAILED:
-    Serial.printf(
-        "OTA Failed (%d): %s\n",
-        httpUpdate.getLastError(),
-        httpUpdate.getLastErrorString().c_str());
-    break;
-
-  case HTTP_UPDATE_NO_UPDATES:
-    Serial.println("No updates.");
-    break;
-
-  case HTTP_UPDATE_OK:
-    Serial.println("OTA Success!");
-    break;
+    Serial.println("No OTA partition found");
+    http.end();
+    return;
   }
 
-  updateHttp.end();
+  Serial.print("Writing to partition: ");
+  Serial.println(updatePartition->label);
+
+  esp_ota_handle_t otaHandle;
+
+  if (esp_ota_begin(
+          updatePartition,
+          OTA_SIZE_UNKNOWN,
+          &otaHandle) != ESP_OK)
+  {
+    Serial.println("esp_ota_begin failed");
+    http.end();
+    return;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+
+  uint8_t buffer[1024];
+
+  mbedtls_sha256_context shaCtx;
+
+  mbedtls_sha256_init(&shaCtx);
+  mbedtls_sha256_starts(&shaCtx, 0);
+
+  int totalWritten = 0;
+
+  while (http.connected() &&
+         (contentLength > 0 || contentLength == -1))
+  {
+    size_t available = stream->available();
+
+    if (available)
+    {
+      int readBytes =
+          stream->readBytes(
+              buffer,
+              min((size_t)1024, available));
+
+      esp_err_t writeResult =
+          esp_ota_write(
+              otaHandle,
+              buffer,
+              readBytes);
+
+      if (writeResult != ESP_OK)
+      {
+        Serial.println("esp_ota_write failed");
+
+        esp_ota_abort(otaHandle);
+
+        http.end();
+
+        return;
+      }
+
+      mbedtls_sha256_update(
+          &shaCtx,
+          buffer,
+          readBytes);
+
+      totalWritten += readBytes;
+
+      if (contentLength > 0)
+      {
+        contentLength -= readBytes;
+      }
+    }
+
+    delay(1);
+  }
+
+  uint8_t hash[32];
+
+  mbedtls_sha256_finish(
+      &shaCtx,
+      hash);
+
+  mbedtls_sha256_free(
+      &shaCtx);
+
+  String calculatedHash =
+      bytesToHex(hash, 32);
+
+  Serial.print("Calculated SHA256: ");
+  Serial.println(calculatedHash);
+
+  Serial.print("Expected SHA256: ");
+  Serial.println(expectedHash);
+
+  if (calculatedHash != expectedHash)
+  {
+    Serial.println("HASH VERIFICATION FAILED");
+
+    esp_ota_abort(otaHandle);
+
+    http.end();
+
+    return;
+  }
+
+  Serial.println("HASH VERIFIED");
+
+  if (esp_ota_end(otaHandle) != ESP_OK)
+  {
+    Serial.println("esp_ota_end failed");
+
+    http.end();
+
+    return;
+  }
+
+  if (esp_ota_set_boot_partition(
+          updatePartition) != ESP_OK)
+  {
+    Serial.println(
+        "Failed to set boot partition");
+
+    http.end();
+
+    return;
+  }
+
+  prefs.begin("ota", false);
+
+  prefs.putInt(
+      "version",
+      serverVersion);
+
+  prefs.end();
+
+  Serial.println("OTA Success!");
+  Serial.println("Version saved.");
+  Serial.println("Rebooting...");
+
+  http.end();
+
+  delay(2000);
+
+  ESP.restart();
 }
 
 // ---------------- SETUP ----------------
@@ -107,8 +223,7 @@ void setup()
   Serial.begin(115200);
   delay(3000);
 
-  Serial.println("\nESP32 OTA Booting V3 TEST");
-
+  Serial.println("\nESP32 OTA Booting VERSION 2");
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
@@ -124,6 +239,7 @@ void setup()
 
   Serial.println();
 
+  // }
   if (WiFi.status() == WL_CONNECTED)
   {
     wifiReady = true;
@@ -132,7 +248,9 @@ void setup()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
-    /////
+    // prefs.begin("ota", false);
+    // prefs.putInt("version", CURRENT_VERSION);
+    // prefs.end();
 
     const esp_partition_t *running =
         esp_ota_get_running_partition();
@@ -148,6 +266,16 @@ void setup()
 
     Serial.print("Free sketch space: ");
     Serial.println(ESP.getFreeSketchSpace());
+
+    prefs.begin("ota", true);
+
+    int storedVersion =
+        prefs.getInt("version", 1);
+
+    prefs.end();
+
+    Serial.print("Stored Version: ");
+    Serial.println(storedVersion);
   }
   else
   {
@@ -192,25 +320,43 @@ void loop()
 
       int serverVersion = doc["version"];
       String firmwareFile = doc["firmware"];
+      String expectedHash = doc["sha256"];
 
-      Serial.print("Current Version: ");
-      Serial.println(CURRENT_VERSION);
+      Serial.print("Expected SHA256: ");
+      Serial.println(expectedHash);
+
+      prefs.begin("ota", true);
+
+      int storedVersion =
+          prefs.getInt("version", CURRENT_VERSION);
+
+      prefs.end();
+
+      Serial.print("Stored Version: ");
+      Serial.println(storedVersion);
 
       Serial.print("Server Version: ");
       Serial.println(serverVersion);
 
-      if (serverVersion > CURRENT_VERSION)
+      if (serverVersion > storedVersion)
       {
         Serial.println("New firmware available!");
 
         String firmwareUrl =
             String(serverBaseUrl) + "/" + firmwareFile;
 
-        runOTA(firmwareUrl);
+        runOTA(
+            firmwareUrl,
+            serverVersion, expectedHash);
+      }
+      else if (serverVersion == storedVersion)
+      {
+        Serial.println("Firmware already up to date.");
       }
       else
       {
-        Serial.println("Firmware already up to date.");
+        Serial.println("Rollback attempt detected!");
+        Serial.println("Update rejected.");
       }
     }
     else

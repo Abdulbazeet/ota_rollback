@@ -1,4 +1,6 @@
 {
-    "version": 2,
-    "firmware": "firmware.bin"
+    "version": 4,
+    "firmware": "firmware.bin",
+    "sha256": "4567878"
+
 }
