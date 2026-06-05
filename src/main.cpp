@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+
 #include <ArduinoJson.h>
 #include "esp_ota_ops.h"
 #include <ESPmDNS.h>
@@ -13,7 +14,7 @@ Preferences prefs;
 const char *ssid = "Tony Stank";
 const char *password = "Ba1za22ta@.com#";
 
-#define CURRENT_VERSION 2
+#define CURRENT_VERSION 5
 
 // const char *serverBaseUrl = "http://10.16.190.150:5000";
 // const char *manifestUrl = "http://10.16.190.150:5000/manifest.json";
@@ -38,6 +39,30 @@ String bytesToHex(uint8_t *hash, size_t len)
   }
 
   return result;
+}
+String downloadSignature(String signatureUrl)
+{
+  HTTPClient http;
+
+  http.begin(signatureUrl);
+
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.print("Signature download failed: ");
+    Serial.println(httpCode);
+
+    http.end();
+
+    return "";
+  }
+
+  String signature = http.getString();
+
+  http.end();
+
+  return signature;
 }
 
 void runOTA(
@@ -200,12 +225,28 @@ void runOTA(
 
     return;
   }
+
+  // Save new version after successful OTA
+
+  prefs.begin("ota", false);
+
+  prefs.putInt(
+      "version",
+      serverVersion);
+
+  prefs.end();
+
+  Serial.print("Saved Version: ");
+  Serial.println(serverVersion);
+
   Serial.println("OTA Success!");
   Serial.println("Rebooting...");
 
   http.end();
 
   delay(2000);
+
+  // before restart
 
   ESP.restart();
 }
@@ -216,7 +257,15 @@ void setup()
   Serial.begin(115200);
   delay(3000);
 
-  Serial.println("\nESP32 OTA Booting VERSION 2");
+  // Serial.println("\nESP32 OTA Booting VERSION 5");
+
+  /// veriosn
+  Serial.print("Firmware Build Version: ");
+  Serial.println(CURRENT_VERSION);
+
+  // prefs.begin("ota", true);
+
+  //
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
@@ -241,15 +290,15 @@ void setup()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
-    prefs.begin("ota", false);
-    prefs.putInt("version", CURRENT_VERSION);
+    prefs.begin("ota", true);
+
+    int storedVersion =
+        prefs.getInt("version", -999);
+
     prefs.end();
 
-    // const esp_partition_t *running =
-    //     esp_ota_get_running_partition();
-
-    // Serial.print("Running partition: ");
-    // Serial.println(running->label);
+    Serial.print("NVS Version Read: ");
+    Serial.println(storedVersion);
 
     const esp_partition_t *running =
         esp_ota_get_running_partition();
@@ -271,13 +320,6 @@ void setup()
 
     Serial.print("Free sketch space: ");
     Serial.println(ESP.getFreeSketchSpace());
-
-    prefs.begin("ota", true);
-
-    int storedVersion =
-        prefs.getInt("version", 1);
-
-    prefs.end();
 
     Serial.print("Stored Version: ");
     Serial.println(storedVersion);
@@ -325,7 +367,9 @@ void loop()
 
       int serverVersion = doc["version"];
       String firmwareFile = doc["firmware"];
+
       String expectedHash = doc["sha256"];
+      String signatureFile = doc["signature"];
 
       Serial.print("Expected SHA256: ");
       Serial.println(expectedHash);
@@ -333,7 +377,7 @@ void loop()
       prefs.begin("ota", true);
 
       int storedVersion =
-          prefs.getInt("version", CURRENT_VERSION);
+          prefs.getInt("version", -1);
 
       prefs.end();
 
@@ -350,9 +394,27 @@ void loop()
         String firmwareUrl =
             String(serverBaseUrl) + "/" + firmwareFile;
 
+        String signatureUrl =
+            String(serverBaseUrl) + "/" + signatureFile;
+
+        String signature =
+            downloadSignature(signatureUrl);
+
+        Serial.print("Signature Length: ");
+        Serial.println(signature.length());
+
+        if (signature.length() == 0)
+        {
+          Serial.println("Signature download failed");
+          return;
+        }
+
+        Serial.println("Signature downloaded successfully");
+
         runOTA(
             firmwareUrl,
-            serverVersion, expectedHash);
+            serverVersion,
+            expectedHash);
       }
       else if (serverVersion == storedVersion)
       {

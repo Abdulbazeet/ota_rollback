@@ -1,6 +1,6 @@
 {
-    "version": 2,
-    "firmware": "firmware.bin",
-    "sha256": "5a4f78b88d03a65be5184113922ef27ee54f12216b7023b25121af770a041560",
-    "signature": "firmware.sig"
+  "version": 5,
+  "firmware": "firmware.bin",
+  "sha256": "1010d670905cfde87b6b9fe5a75af304737924617b289bbbdfef3d11ea84b78a",
+  "signature": "firmware.sig"
 }
